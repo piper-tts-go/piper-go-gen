@@ -3,8 +3,8 @@ module github.com/amitybell/piper-gen
 go 1.21
 
 require (
-	github.com/amitybell/piper v0.0.0-20231118085404-02c78db4fc29
-	github.com/klauspost/compress v1.17.3
+	github.com/amitybell/piper v0.0.0-20240130090909-b170e42b1e09
+	github.com/klauspost/compress v1.17.8
 	github.com/mholt/archiver/v4 v4.0.0-alpha.8
 	github.com/zeebo/xxh3 v1.0.2
 )
