@@ -446,7 +446,7 @@ func main() {
 	archives := map[string]string{
 		"linux":   "https://github.com/piper-tts-go/piper/releases/download/" + piperVersion + "/piper_linux_x86_64.tar.gz",
 		"windows": "https://github.com/piper-tts-go/piper/releases/download/" + piperVersion + "/piper_windows_amd64.zip",
-		"darwin":  "https://github.com/piper-tts-go/piper/releases/download/" + piperVersion + "/piper_windows_amd64.zip",
+		"darwin":  "https://github.com/piper-tts-go/piper/releases/download/" + piperVersion + "/piper_macos_aarch64.tar.gz",
 	}
 	for plaform, url := range archives {
 		if err := installPiper(ctx, *dir, plaform, piperVersion, url); err != nil {
