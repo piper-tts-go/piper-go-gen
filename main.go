@@ -5,11 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"hash"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,8 +18,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/amitybell/piper"
+	"github.com/klauspost/compress/zstd"
 	"github.com/mholt/archiver/v4"
+	"github.com/rs/zerolog/log"
 	"github.com/zeebo/xxh3"
 )
 
@@ -28,129 +29,132 @@ type Meta struct {
 	Hash    xxh3.Uint128
 }
 
-func download(rootDir string, srcURL string) (dlFn string, retErr error) {
-	dlFn = filepath.Join(
+const (
+	ArchiveFilename  = "dist.tzst"
+	MetadataFilename = "dist.json"
+)
+
+func download(rootDir string, srcURL string) (filename string, retErr error) {
+	log.Info().Str("url", srcURL).Msg("downloading file")
+	filename = filepath.Join(
 		rootDir,
 		"piper-gen.cache",
 		url.QueryEscape(srcURL),
 	)
-	if _, err := os.Stat(dlFn); err == nil {
-		return dlFn, nil
+	if _, err := os.Stat(filename); err == nil {
+		return filename, nil
 	}
 
-	os.MkdirAll(filepath.Dir(dlFn), 0o755)
+	os.MkdirAll(filepath.Dir(filename), 0o755)
 
-	out, err := os.Create(dlFn)
+	out, err := os.Create(filename)
 	defer func() {
 		closeErr := out.Close()
 		if closeErr != nil && retErr == nil {
 			retErr = closeErr
 		}
 		if retErr != nil {
-			retErr = fmt.Errorf("download `%s` to `%s` failed: %w", srcURL, dlFn, err)
+			retErr = fmt.Errorf("failed to download %q: %w", srcURL, retErr)
 		}
 	}()
 
-	res, err := http.Get(srcURL)
+	response, err := http.Get(srcURL)
 	if err != nil {
-		return "", fmt.Errorf("download: http.Get: %w", err)
+		return "", fmt.Errorf("failed to download %q: %w", srcURL, err)
 	}
-	defer res.Body.Close()
+	defer response.Body.Close()
 
-	if _, err := io.Copy(out, res.Body); err != nil {
-		return "", fmt.Errorf("download: Copy: %w", err)
+	if _, err := io.Copy(out, response.Body); err != nil {
+		return "", fmt.Errorf("failed to download %q: %w", srcURL, err)
 	}
-	return dlFn, nil
+	return filename, nil
 }
 
 func Extract(ctx context.Context, rootDir string, f archiver.File) (retErr error) {
-	rfi, err := f.Stat()
+	info, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("Extract: stat archive file: %w", err)
+		return fmt.Errorf("failed to read file info: %w", err)
 	}
-	if rfi.IsDir() {
+	if info.IsDir() {
 		return nil
 	}
 
-	fn := filepath.Join(rootDir, filepath.Clean(filepath.FromSlash(f.NameInArchive)))
-	if _, err := os.Stat(fn); err == nil {
+	filename := filepath.Join(rootDir, filepath.Clean(filepath.FromSlash(f.NameInArchive)))
+	if _, err := os.Stat(filename); err == nil {
 		return nil
 	}
 
-	os.MkdirAll(filepath.Dir(fn), 0o755)
+	os.MkdirAll(filepath.Dir(filename), 0o755)
 
-	if rfi.Mode().Type()&os.ModeSymlink == os.ModeSymlink {
-		err := os.Symlink(f.LinkTarget, fn)
+	if info.Mode().Type()&os.ModeSymlink == os.ModeSymlink {
+		err := os.Symlink(f.LinkTarget, filename)
 		if err != nil {
-			return fmt.Errorf("Extract: create symlink: %w", err)
+			return fmt.Errorf("failed to symlink %q to %q: %w", filename, f.LinkTarget, err)
 		}
 	}
 
-	if !rfi.Mode().IsRegular() {
+	if !info.Mode().IsRegular() {
 		return nil
 	}
 
-	r, err := f.Open()
+	reader, err := f.Open()
 	if err != nil {
-		if err != nil {
-			return fmt.Errorf("Extract: open archive file: %w", err)
-		}
+		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer r.Close()
-	w, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE|os.O_TRUNC, f.Mode().Perm())
+	defer reader.Close()
+	writer, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, f.Mode().Perm())
 	if err != nil {
-		if err != nil {
-			return fmt.Errorf("Extract: create output file: %w", err)
-		}
+		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer func() {
-		cloErr := w.Close()
+		closeErr := writer.Close()
 		if retErr != nil {
 			return
 		}
-		if cloErr != nil {
-			retErr = fmt.Errorf("Extract: close output file: %w", err)
+		if closeErr != nil {
+			retErr = fmt.Errorf("failed to close file: %w", closeErr)
 		}
 	}()
-	if _, err := io.Copy(w, r); err != nil {
-		return fmt.Errorf("Extract: copy file: %w", err)
+	if _, err := io.Copy(writer, reader); err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
 	}
 	return nil
 }
 
 type voiceInfo struct {
-	ONXX      string
+	ONNX      string
 	ModelCard string
 	JSON      string
 }
 
-func hashFile(hs hash.Hash, fn string) error {
-	f, err := os.Open(fn)
+func hashFile(h hash.Hash, filename string) error {
+	f, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(hs, f); err != nil {
+	if _, err := io.Copy(h, f); err != nil {
 		return err
 	}
 	return nil
 }
 
-func runCmd(dir string, name string, args ...string) error {
+func run(workingDirectory string, program string, args ...string) error {
 	stderr := bytes.NewBuffer(nil)
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command(program, args...)
 	cmd.Stderr = stderr
 	cmd.Stdout = stderr
-	cmd.Dir = dir
+	cmd.Dir = workingDirectory
+	log.Info().Str("program", program).Strs("args", args).Msg("running executable command")
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("runCmd: %s: %w: %s", cmd, err, stderr.Bytes())
+		return fmt.Errorf("failed to run `%s %s`: %w: %s", program, strings.Join(args, " "), err, stderr.Bytes())
 	}
 	return nil
 }
 
-func finalizePkg(voicePkg bool, pkgDir, embedPkgName, pkgPath string, assetName string, version string, embedPaths ...string) error {
+func generatePackage(voicePkg bool, pkgDir, embedPkgName, pkgPath string, assetName string, version string, embedPaths ...string) error {
 	embedPaths = append([]string{
-		piper.DistArcName,
-		piper.DistMetaName,
+		ArchiveFilename,
+		MetadataFilename,
 	}, embedPaths...)
 
 	embedGo := []byte(`// GENERATED FILE
@@ -159,7 +163,7 @@ package ` + embedPkgName + `
 
 import (
 	"embed"
-	"github.com/amitybell/piper-asset"
+	"github.com/piper-tts-go/piper-go-asset"
 )
 
 var (
@@ -180,6 +184,7 @@ go 1.21
 MIT License
 
 Copyright (c) 2023 Amity Bell
+Copyright (c) 2025 Dharma Bellamkonda
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -199,17 +204,17 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 `)
 
-	distLicense := "https://github.com/rhasspy/piper"
+	distLicense := "https://github.com/piper-tts-go/piper"
 	if voicePkg {
 		distLicense = "[MODEL_CARD.txt](MODEL_CARD.txt)"
 	}
 
 	readmeMd := []byte(`
-Package auto-generated by https://github.com/amitybell/piper-gen
+Package auto-generated by https://github.com/piper-tts-go/piper-gen
 
 - Package license: See [LICENSE](LICENSE)
 - dist.tar.zst license: See ` + distLicense + `
-- See https://github.com/amitybell/piper for docs
+- See https://github.com/piper-tts-go/piper for docs
 `)
 
 	if err := os.WriteFile(filepath.Join(pkgDir, "embed.go"), embedGo, 0o644); err != nil {
@@ -224,180 +229,180 @@ Package auto-generated by https://github.com/amitybell/piper-gen
 	if err := os.WriteFile(filepath.Join(pkgDir, "LICENSE"), license, 0o644); err != nil {
 		return err
 	}
-	if err := installMeta(pkgDir, version, filepath.Join(pkgDir, piper.DistArcName)); err != nil {
+	if err := installMeta(pkgDir, version, filepath.Join(pkgDir, ArchiveFilename)); err != nil {
 		return err
 	}
-	if err := runCmd(pkgDir, "go", "mod", "tidy"); err != nil {
+	if err := run(pkgDir, "go", "mod", "tidy"); err != nil {
 		return err
 	}
-	if err := runCmd(pkgDir, "go", "build", "."); err != nil {
+	if err := run(pkgDir, "go", "build", "."); err != nil {
 		return err
 	}
 	return nil
 }
 
-func installMeta(dir string, version string, fns ...string) error {
-	fns = append([]string(nil), fns...)
-	sort.Strings(fns)
+func installMeta(dir string, version string, filenames ...string) error {
+	filenames = append([]string(nil), filenames...)
+	sort.Strings(filenames)
 
-	hs := xxh3.New()
-	for _, fn := range fns {
-		if err := hashFile(hs, fn); err != nil {
-			return fmt.Errorf("installMeta: generate hash: %w", err)
+	h := xxh3.New()
+	for _, filename := range filenames {
+		if err := hashFile(h, filename); err != nil {
+			return fmt.Errorf("failed to hash file %q: %w", filename, err)
 		}
 	}
 	src, err := json.Marshal(Meta{
 		Version: version,
-		Hash:    hs.Sum128(),
+		Hash:    h.Sum128(),
 	})
 	if err != nil {
-		return fmt.Errorf("installMeta: Marshal: %w", err)
+		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, piper.DistMetaName), src, 0o644); err != nil {
-		return fmt.Errorf("installMeta: write hash file: %w", err)
+	if err := os.WriteFile(filepath.Join(dir, MetadataFilename), src, 0o644); err != nil {
+		return fmt.Errorf("failed to write metadata: %w", err)
 	}
 	return nil
 }
 
-func copyFile(dstFn, srcFn string) error {
-	r, err := os.Open(srcFn)
+func copyFile(dest, src string) error {
+	srcFile, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("copyFile: open `%s`: %w", srcFn, err)
+		return fmt.Errorf("failed to open %q: %w", src, err)
 	}
-	defer r.Close()
+	defer srcFile.Close()
 
-	w, err := os.Create(dstFn)
+	destFile, err := os.Create(dest)
 	if err != nil {
-		return fmt.Errorf("copyFile: create `%s`: %w", dstFn, err)
+		return fmt.Errorf("failed to create %q: %w", dest, err)
 	}
-	_, copyErr := io.Copy(w, r)
-	closeErr := w.Close()
+	_, copyErr := io.Copy(destFile, srcFile)
+	closeErr := destFile.Close()
 	if copyErr != nil {
-		return fmt.Errorf("copyFile: copy(`%s`, `%s`): %w", dstFn, srcFn, err)
+		return fmt.Errorf("failed to copy %q to %q: %w", src, dest, copyErr)
 	}
 	if closeErr != nil {
-		return fmt.Errorf("copyFile: close `%s`: %w", dstFn, err)
+		return fmt.Errorf("failed to close %q: %w", dest, closeErr)
 	}
 	return nil
 }
 
 func installVoice(rootDir, name string, version string, urls []string) error {
-	pkgBase := "piper-voice-" + name
-	pkgDir := filepath.Join(rootDir, pkgBase)
-	pkgPath := "github.com/amitybell/" + pkgBase
+	packageName := "piper-voice-" + name
+	packageDirectory := filepath.Join(rootDir, packageName)
+	packagePath := "github.com/piper-tts-go/" + packageName
 
-	arcFn := filepath.Join(pkgDir, piper.DistArcName)
-	tzw, err := createTarZst(arcFn)
+	archiveFilename := filepath.Join(packageDirectory, ArchiveFilename)
+	tarball, err := newTarball(archiveFilename)
 	if err != nil {
-		return fmt.Errorf("installVoice: %w", err)
+		return fmt.Errorf("failed to create tarball: %w", err)
 	}
 
-	modelDlFn := ""
+	modelFilename := ""
 	for _, url := range urls {
-		nm := filepath.Base(url)
-		ext := filepath.Ext(nm)
+		basename := filepath.Base(url)
+		extension := filepath.Ext(basename)
 		switch {
-		case nm == "MODEL_CARD":
-		case ext == ".onnx":
-			nm = "voice.onnx"
-		case ext == ".json":
-			nm = "voice.json"
+		case basename == "MODEL_CARD":
+		case extension == ".onnx":
+			basename = "voice.onnx"
+		case extension == ".json":
+			basename = "voice.json"
 		default:
-			return fmt.Errorf("installVoice: Unsupported file: %s", nm)
+			return fmt.Errorf("encountered unexpected file extension %q", extension)
 		}
-		dlFn, err := download(rootDir, url)
+		filename, err := download(rootDir, url)
 		if err != nil {
-			return fmt.Errorf("installVoice: %w", err)
+			return fmt.Errorf("failed to download voice: %w", err)
 		}
-		if err := tzw.AppendFile(nm, dlFn); err != nil {
-			return fmt.Errorf("installVoice: %w", err)
+		if err := tarball.AppendFile(basename, filename); err != nil {
+			return fmt.Errorf("failed to add %q to tarball: %w", filename, err)
 		}
-		if nm == "MODEL_CARD" {
-			modelDlFn = dlFn
+		if basename == "MODEL_CARD" {
+			modelFilename = filename
 		}
 	}
 
-	if err := tzw.Close(); err != nil {
-		return fmt.Errorf("installVoice: close archive: %w", err)
+	if err := tarball.Close(); err != nil {
+		return fmt.Errorf("failed to close tarball: %w", err)
 	}
-	if err := copyFile(filepath.Join(pkgDir, "MODEL_CARD.txt"), modelDlFn); err != nil {
-		return fmt.Errorf("installVoice: %w", err)
+	if err := copyFile(filepath.Join(packageDirectory, "MODEL_CARD.txt"), modelFilename); err != nil {
+		return fmt.Errorf("failed to copy MODEL_CARD.txt into package: %w", err)
 	}
-	if err := finalizePkg(true, pkgDir, name, pkgPath, name, version, "MODEL_CARD.txt"); err != nil {
-		return fmt.Errorf("installVoice: %w", err)
+	if err := generatePackage(true, packageDirectory, name, packagePath, name, version, "MODEL_CARD.txt"); err != nil {
+		return fmt.Errorf("failed to generate package: %w", err)
 	}
 	return nil
 }
 
-func installPiper(rootDir, pkgName, version, url string) (retErr error) {
-	ctx := context.Background()
-	pkgBase := "piper-bin-" + pkgName
-	pkgPath := "github.com/amitybell/" + pkgBase
-	pkgDir := filepath.Join(rootDir, pkgBase)
-	dlFn, err := download(rootDir, url)
+func installPiper(ctx context.Context, rootDir, pkgName, version, url string) (retErr error) {
+	packageName := "piper-bin-" + pkgName
+	packageDirectory := filepath.Join(rootDir, packageName)
+	packagePath := "github.com/piper-tts-go/" + packageName
+	filename, err := download(rootDir, url)
 	if err != nil {
-		return fmt.Errorf("installPiper: %w", err)
+		return fmt.Errorf("failed to download piper: %w", err)
 	}
-	srcFile, err := os.Open(dlFn)
+	srcFile, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("installPiper: open archive: %w", err)
+		return fmt.Errorf("failed to open %q: %w", filename, err)
 	}
 	defer srcFile.Close()
 
-	srcFmt, stream, err := archiver.Identify(srcFile.Name(), srcFile)
+	format, stream, err := archiver.Identify(srcFile.Name(), srcFile)
 	if err != nil {
-		return fmt.Errorf("installPiper: identify archive: %w", err)
+		return fmt.Errorf("could not identify %q: %w", srcFile.Name(), err)
 	}
 
-	srcArc, ok := srcFmt.(archiver.Extractor)
+	extractor, ok := format.(archiver.Extractor)
 	if !ok {
-		return fmt.Errorf("installPiper: %T is not an archiver.Extractor: `%s`", srcFmt, srcFile.Name())
+		return fmt.Errorf("%T is not an archiver.Extractor: `%s`", format, srcFile.Name())
 	}
 
-	dstFn := filepath.Join(pkgDir, piper.DistArcName)
-	tzw, err := createTarZst(dstFn)
+	destFilename := filepath.Join(packageDirectory, ArchiveFilename)
+	tarball, err := newTarball(destFilename)
 	if err != nil {
-		return fmt.Errorf("installPiper: %w", err)
+		return fmt.Errorf("failed to create tarball: %w", err)
 	}
-	err = srcArc.Extract(
+	err = extractor.Extract(
 		ctx,
 		stream,
 		[]string{"piper"},
 		func(ctx context.Context, f archiver.File) error {
-			fm := f.Mode()
-			if !fm.IsRegular() && fm&os.ModeSymlink == 0 {
+			fileMode := f.Mode()
+			if !fileMode.IsRegular() && fileMode&os.ModeSymlink == 0 {
 				return nil
 			}
-			r, err := f.Open()
+			reader, err := f.Open()
 			if err != nil {
 				return err
 			}
-			defer r.Close()
-			h := &tar.Header{
+			defer reader.Close()
+			header := &tar.Header{
 				Name:     strings.TrimPrefix(f.NameInArchive, "piper/"),
 				Mode:     int64(f.Mode()),
 				Size:     f.Size(),
 				Linkname: f.LinkTarget,
 			}
-			if fm&os.ModeSymlink != 0 {
-				h.Typeflag = tar.TypeSymlink
+			if fileMode&os.ModeSymlink != 0 {
+				header.Typeflag = tar.TypeSymlink
 			}
-			return tzw.Append(h, r)
+			return tarball.Append(header, reader)
 		},
 	)
-	if e := tzw.Close(); e != nil && err == nil {
-		return fmt.Errorf("installPiper: close tar.zst: %w", e)
+	if e := tarball.Close(); e != nil && err == nil {
+		return fmt.Errorf("failed to close tarball: %w", e)
 	}
 	if err != nil {
-		return fmt.Errorf("installPiper: extract: %w", err)
+		return fmt.Errorf("failed to extract piper: %w", err)
 	}
-	if err := finalizePkg(false, pkgDir, pkgName, pkgPath, pkgName, version); err != nil {
-		return fmt.Errorf("installPiper: %w", err)
+	if err := generatePackage(false, packageDirectory, pkgName, packagePath, pkgName, version); err != nil {
+		return fmt.Errorf("failed to generate package: %w", err)
 	}
 	return nil
 }
 
 func main() {
+	ctx := context.Background()
 	dir := flag.String("dir", "", "root directory to extract store files")
 	flag.Parse()
 	if *dir == "" {
@@ -408,38 +413,132 @@ func main() {
 
 	// more voices at https://huggingface.co/rhasspy/piper-voices/tree/v1.0.0
 	voiceVersion := "1.0.0"
-	voiceURLPfx := "https://huggingface.co/rhasspy/piper-voices/resolve/v" + voiceVersion
+	urlPrefix := "https://huggingface.co/rhasspy/piper-voices/resolve/v" + voiceVersion
 	voices := map[string][]string{
 		"jenny": {
-			voiceURLPfx + "/en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx",
-			voiceURLPfx + "/en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx.json",
-			voiceURLPfx + "/en/en_GB/jenny_dioco/medium/MODEL_CARD",
+			urlPrefix + "/en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx",
+			urlPrefix + "/en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx.json",
+			urlPrefix + "/en/en_GB/jenny_dioco/medium/MODEL_CARD",
 		},
 		"alan": {
-			voiceURLPfx + "/en/en_GB/alan/medium/en_GB-alan-medium.onnx",
-			voiceURLPfx + "/en/en_GB/alan/medium/MODEL_CARD",
-			voiceURLPfx + "/en/en_GB/alan/medium/en_GB-alan-medium.onnx.json",
+			urlPrefix + "/en/en_GB/alan/medium/en_GB-alan-medium.onnx",
+			urlPrefix + "/en/en_GB/alan/medium/MODEL_CARD",
+			urlPrefix + "/en/en_GB/alan/medium/en_GB-alan-medium.onnx.json",
 		},
-		"vi": {
-			voiceURLPfx + "/vi/vi_VN/vivos/x_low/vi_VN-vivos-x_low.onnx",
-			voiceURLPfx + "/vi/vi_VN/vivos/x_low/MODEL_CARD",
-			voiceURLPfx + "/vi/vi_VN/vivos/x_low/vi_VN-vivos-x_low.onnx.json",
+		"kristin": {
+			urlPrefix + "/en/en_US/kristin/medium/en_US-kristin-medium.onnx",
+			urlPrefix + "/en/en_US/kristin/medium/MODEL_CARD",
+			urlPrefix + "/en/en_US/kristin/medium/en_US-kristin-medium.onnx.json",
+		},
+		"bryce": {
+			urlPrefix + "/en/en_US/bryce/medium/en_US-bryce-medium.onnx",
+			urlPrefix + "/en/en_US/bryce/medium/MODEL_CARD",
+			urlPrefix + "/en/en_US/bryce/medium/en_US-bryce-medium.onnx.json",
 		},
 	}
 	for name, urls := range voices {
 		if err := installVoice(*dir, name, voiceVersion, urls); err != nil {
-			log.Fatalln(err)
+			log.Fatal().Err(err).Str("voice", name).Msg("failed to install voice")
 		}
 	}
 
-	piperVersion := "2023.11.14-2"
+	piperVersion := "v2.0.0"
 	archives := map[string]string{
-		"linux":   "https://github.com/rhasspy/piper/releases/download/" + piperVersion + "/piper_linux_x86_64.tar.gz",
-		"windows": "https://github.com/rhasspy/piper/releases/download/" + piperVersion + "/piper_windows_amd64.zip",
+		"linux":   "https://github.com/piper-tts-go/piper/releases/download/" + piperVersion + "/piper_linux_x86_64.tar.gz",
+		"windows": "https://github.com/piper-tts-go/piper/releases/download/" + piperVersion + "/piper_windows_amd64.zip",
+		"darwin":  "https://github.com/piper-tts-go/piper/releases/download/" + piperVersion + "/piper_windows_amd64.zip",
 	}
 	for plaform, url := range archives {
-		if err := installPiper(*dir, plaform, piperVersion, url); err != nil {
-			log.Fatalln(err)
+		if err := installPiper(ctx, *dir, plaform, piperVersion, url); err != nil {
+			log.Fatal().Err(err).Str("platform", plaform).Msg("failed to install piper")
 		}
 	}
+}
+
+type Tarball struct {
+	file    *os.File
+	encoder *zstd.Encoder
+	writer  *tar.Writer
+}
+
+func newTarball(filename string, opts ...zstd.EOption) (*Tarball, error) {
+	if opts == nil {
+		opts = []zstd.EOption{
+			zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+		}
+	}
+
+	os.MkdirAll(filepath.Dir(filename), 0755)
+	file, err := os.Create(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file %q: %w", filename, err)
+	}
+
+	encoder, err := zstd.NewWriter(file, opts...)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
+	}
+
+	writer := &Tarball{
+		file:    file,
+		encoder: encoder,
+		writer:  tar.NewWriter(encoder),
+	}
+	return writer, nil
+}
+
+func (tb *Tarball) Append(h *tar.Header, r io.Reader) error {
+	if err := tb.writer.WriteHeader(h); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+	if _, err := io.Copy(tb.writer, r); err != nil {
+		return fmt.Errorf("failed to copy data: %w", err)
+	}
+	if err := tb.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush data: %w", err)
+	}
+	return nil
+}
+
+func (tb *Tarball) AppendFile(dest, src string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open %q: %w", src, err)
+	}
+	defer f.Close()
+
+	info, err := os.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("failed to read file info: %w", err)
+	}
+	header := &tar.Header{
+		Name: dest,
+		Mode: int64(info.Mode()),
+		Size: info.Size(),
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		nm, err := os.Readlink(src)
+		if err != nil {
+			return fmt.Errorf("failed to read symlink: %w", err)
+		}
+		header.Linkname = nm
+	}
+	if err := tb.Append(header, f); err != nil {
+		return fmt.Errorf("failed to append file %q: %w", src, err)
+	}
+	return nil
+}
+
+func (tb *Tarball) Close() (err error) {
+	if closeErr := tb.writer.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("failed to close writer: %w", closeErr))
+	}
+	if closeErr := tb.encoder.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("failed to close encoder: %w", closeErr))
+	}
+	if closeErr := tb.file.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("failed to close file: %w", closeErr))
+	}
+	return
 }
